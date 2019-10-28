@@ -1,0 +1,9 @@
+[package]
+name = "tcprust"
+version = "0.1.0"
+authors = ["Henry Royal <dev@hwr.io>"]
+edition = "2018"
+
+[dependencies]
+tun-tap = "0.1.2"
+etherparse = "0.8.2"
