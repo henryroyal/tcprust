@@ -1,7 +1,6 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io;
-use std::ops::Deref;
 
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
 use tun_tap::{Iface, Mode};
@@ -12,7 +11,7 @@ pub mod tcp;
 
 fn main() -> io::Result<()> {
     let mut buf = [0u8; 1504];
-    let mut connections: HashMap<tcp::Quad, tcp::State> = Default::default();
+    let mut connections: HashMap<tcp::Quad, tcp::Connection> = Default::default();
 
     let mut nic = Iface::without_packet_info("tun0", Mode::Tun)
         .expect("Failed to initialize tun0 interface");
@@ -40,15 +39,22 @@ fn main() -> io::Result<()> {
                                 dst: (dst, tcph.destination_port()),
                             }) {
                             Entry::Occupied(mut oe) => {
-                                oe.get_mut().on_packet(&mut nic, iph, tcph, &buf[datai..nbytes])
+                                if let Err(e) = oe.get_mut().on_packet(&mut nic, iph, tcph, &buf[datai..nbytes]) {
+                                    eprintln!("Error: {}", e);
+                                } else {
+                                    eprintln!("Packet {:?}", &buf[..]);
+                                }
                             }
+
                             Entry::Vacant(mut ve) => {
-                                if let Some(c) = tcp::Connection::accept(
+                                if let Some(c) = tcp::Connection::default().accept(
                                     &mut nic,
                                     iph,
                                     tcph,
                                     &buf[datai..nbytes],
-                                )? {
+                                )?
+                                {
+                                    eprintln!("Accept: {:?}", c);
                                     ve.insert(c);
                                 }
                             }
@@ -67,5 +73,5 @@ fn main() -> io::Result<()> {
         }
     }
 
-    Ok(())
+    // Ok(())
 }

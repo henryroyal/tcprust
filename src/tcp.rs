@@ -1,5 +1,5 @@
+use std::cmp::Ordering;
 use std::io;
-use std::io::prelude::*;
 use std::net::Ipv4Addr;
 use std::ops::Deref;
 
@@ -7,12 +7,13 @@ use etherparse::{Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
 use etherparse::IpTrafficClass;
 use tun_tap::Iface;
 
-#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct Quad {
-    src: (Ipv4Addr, u16),
-    dst: (Ipv4Addr, u16),
+    pub src: (Ipv4Addr, u16),
+    pub dst: (Ipv4Addr, u16),
 }
 
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub enum State {
     Closed,
     Listen,
@@ -34,6 +35,7 @@ pub enum State {
 ///        2 - sequence numbers of unacknowledged data
 ///        3 - sequence numbers allowed for new data transmission
 ///        4 - future sequence numbers which are not yet allowed
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
 struct SendSequenceSpace {
     /// send unacknowledged
     una: u32,
@@ -62,6 +64,7 @@ struct SendSequenceSpace {
 /// 1 - old sequence numbers which have been acknowledged
 /// 2 - sequence numbers allowed for new reception
 /// 3 - future sequence numbers which are not yet allowed
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
 struct RecvSequenceSpace {
     /// receive next
     nxt: u32,
@@ -82,6 +85,7 @@ struct RecvSequenceSpace {
 /// * RST: Reset the connection
 /// * SYN: Syncronize sequence numbers
 /// * FIN: No more data from sender
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Connection {
     state: State,
     send: SendSequenceSpace,
@@ -109,9 +113,22 @@ impl Default for Connection {
     fn default() -> Self {
         Connection {
             state: State::Listen,
-            send: SendSequenceSpace,
-            recv: RecvSequenceSpace,
-            ip: Ipv4Header,
+            send: SendSequenceSpace {
+                una: 0,
+                nxt: 0,
+                wnd: 0,
+                up: false,
+                wl1: 0,
+                wl2: 0,
+                iss: 0,
+            },
+            recv: RecvSequenceSpace {
+                nxt: 0,
+                wnd: 0,
+                up: false,
+                irs: 0,
+            },
+            ip: Ipv4Header::default(),
         }
     }
 }
@@ -127,7 +144,7 @@ impl Connection {
     ) -> io::Result<Option<Self>> {
         let mut buf = [0u8; 1500];
         if !tcph.syn() {
-            !eprintln!("Closed->Listen flow requires an original SYN");
+            eprintln!("Closed->Listen flow requires an original SYN");
             return Ok(None);
         }
 
@@ -141,8 +158,8 @@ impl Connection {
 
         // start establishing a response
         let mut syn_ack = TcpHeader::new(
-            dport,
-            sport,
+            tcph.destination_port(),
+            tcph.source_port(),
             0,
             10,
         );
@@ -151,8 +168,8 @@ impl Connection {
             syn_ack.header_len(),
             64,
             IpTrafficClass::Tcp,
-            dst.octets(),
-            src.octets(),
+            iph.destination_addr().octets(),
+            iph.source_addr().octets(),
         );
 
         let iss: u32 = 0;
@@ -173,7 +190,7 @@ impl Connection {
                 wnd: tcph.window_size(),
                 up: false,
             },
-            ip: Ipv4Header::new(),
+            ip: Ipv4Header::default(),
         };
 
         syn_ack.acknowledgment_number = self.recv.nxt;
@@ -186,8 +203,8 @@ impl Connection {
 
         let mut unwritten = {
             let mut unwritten = &mut buf[..];
-            ip.write(unwritten);
-            syn_ack.write(unwritten);
+            ip.write(&mut unwritten);
+            syn_ack.write(&mut unwritten);
             unwritten.len()
         };
 
@@ -202,17 +219,23 @@ impl Connection {
         tcph: TcpHeaderSlice<'a>,
         data: &'a [u8],
     ) -> io::Result<()> {
-        // first, acceptable ack check - https://tools.ietf.org/html/rfc793#section-3.3
+        // acceptable ack check - https://tools.ietf.org/html/rfc793#section-3.3
         // SND.UNA < SEG.ACK =< SND.NXT - is violated if n is between u and a
         let ackn = tcph.acknowledgment_number();
-        if self.send.una < ack {
-            // this is the easy case where no wraparound
-        } else {
-            // n may have wrapped -- check that n is not between a and u
-            if self.send.nxt >= ackn && self.send.nxt <= self.send.una { // fine
-            } else {
-                return Ok(());
-            }
+        if !is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
+            return Ok(());
+        }
+
+        // valid segment checks
+        // RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
+        let datalen = data.deref().len() as u32;
+        let seqn = tcph.sequence_number();
+        let wend = self.recv.nxt.wrapping_add(self.recv.wnd as u32);
+
+        let start_inside_window = is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend);
+        let end_inside_window = is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn + datalen - 1, wend);
+        if !start_inside_window && !end_inside_window {
+            return Ok(());
         }
 
         // next, valid segment check
@@ -232,11 +255,26 @@ impl Connection {
     }
 }
 
-
-fn is_between_wrapped(start: usize, x: usize, end: usize) -> bool {
-    if start < x {
-        if end >= start && end < x { return true; }
-    } else {}
-
-    false
+// TODO - review this
+///Return bool indicating whether sequence number indicated
+fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
+    match start.cmp(&x) {
+        Ordering::Equal => return false,
+        Ordering::Less => {
+            // |-----s------x-----|
+            // X is between S and E
+            if end >= start && end <= x {
+                return false;
+            }
+        }
+        Ordering::Greater => {
+            // |-----x-----s------|
+            if end < start && end > x {
+                // do nothing
+            } else {
+                return false;
+            }
+        }
+    }
+    true
 }
